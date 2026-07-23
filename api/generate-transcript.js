@@ -20,36 +20,82 @@ const toTranscript = (item) => {
   return ''
 }
 
+const chunkText = (text, maxChunkSize = 1000) => {
+  const chunks = []
+  let currentChunk = ''
+  const sentences = text.split(/(?<=[.!?])\s+/) // Split by sentence endings
+
+  for (const sentence of sentences) {
+    if ((currentChunk + ' ' + sentence).length <= maxChunkSize) {
+      currentChunk = currentChunk ? currentChunk + ' ' + sentence : sentence
+    } else {
+      if (currentChunk) chunks.push(currentChunk)
+      currentChunk = sentence.length > maxChunkSize ? sentence.slice(0, maxChunkSize) : sentence
+    }
+  }
+
+  if (currentChunk) chunks.push(currentChunk)
+  return chunks
+}
+
 const translateTextToEnglish = async (text) => {
-  try {
+  if (!text || typeof text !== 'string') return text
+  
+  console.log('Starting translation to English, text length:', text.length)
+  
+  const chunks = chunkText(text)
+  console.log(`Split into ${chunks.length} chunks for translation`)
+  
+  const translatedChunks = []
+  
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i]
+    console.log(`Translating chunk ${i+1}/${chunks.length}, length: ${chunk.length}`)
+    
+    let translatedChunk = null
+    
     // Try MyMemory first
-    const myMemoryRes = await fetch(
-      `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=|en`
-    )
-    const myMemoryData = await myMemoryRes.json()
-    if (myMemoryData.responseStatus === 200 && myMemoryData.responseData?.translatedText) {
-      return myMemoryData.responseData.translatedText
+    try {
+      const myMemoryRes = await fetch(
+        `https://api.mymemory.translated.net/get?q=${encodeURIComponent(chunk)}&langpair=|en`
+      )
+      const myMemoryData = await myMemoryRes.json()
+      if (myMemoryData.responseStatus === 200 && myMemoryData.responseData?.translatedText) {
+        translatedChunk = myMemoryData.responseData.translatedText
+        console.log(`Chunk ${i+1} translated with MyMemory`)
+      }
+    } catch (e) {
+      console.error('MyMemory translation failed for chunk:', e)
     }
-  } catch (e) {
-    console.error('MyMemory translation failed:', e)
-  }
-
-  // Try Lingva as fallback
-  try {
-    const lingvaRes = await fetch(`https://lingva.lunar.icu/api/v1/auto/en/${encodeURIComponent(text)}`)
-    const lingvaData = await lingvaRes.json()
-    if (lingvaData.translation) {
-      return lingvaData.translation
+    
+    // Try Lingva as fallback
+    if (!translatedChunk) {
+      try {
+        const lingvaRes = await fetch(`https://lingva.lunar.icu/api/v1/auto/en/${encodeURIComponent(chunk)}`)
+        const lingvaData = await lingvaRes.json()
+        if (lingvaData.translation) {
+          translatedChunk = lingvaData.translation
+          console.log(`Chunk ${i+1} translated with Lingva`)
+        }
+      } catch (e) {
+        console.error('Lingva translation failed for chunk:', e)
+      }
     }
-  } catch (e) {
-    console.error('Lingva translation failed:', e)
+    
+    translatedChunks.push(translatedChunk || chunk)
   }
-
-  return text // Return original if all fail
+  
+  const finalTranslatedText = translatedChunks.join(' ')
+  console.log('Translation completed, final length:', finalTranslatedText.length)
+  
+  return finalTranslatedText
 }
 
 const transcribeWithAssemblyAI = async (videoId) => {
   const apiKey = process.env.ASSEMBLYAI_API_KEY
+  if (!apiKey) {
+    throw new Error('AssemblyAI API key is missing')
+  }
   const videoUrl = `https://www.youtube.com/watch?v=${videoId}`
 
   console.log('Starting AssemblyAI transcription for video:', videoId)
@@ -77,10 +123,10 @@ const transcribeWithAssemblyAI = async (videoId) => {
   const { id } = await submitResponse.json()
   console.log('AssemblyAI job submitted, ID:', id)
 
-  // Poll for completion - faster polling (3 seconds instead of 5)
+  // Poll for completion - 3 seconds, 300 attempts (15 minutes max)
   let status = 'processing'
   let attempts = 0
-  const maxAttempts = 180 // 9 minutes max
+  const maxAttempts = 300 // 15 minutes max for very long videos
 
   while ((status === 'processing' || status === 'queued') && attempts < maxAttempts) {
     await new Promise(resolve => setTimeout(resolve, 3000)) // Wait 3 seconds
@@ -116,7 +162,7 @@ const transcribeWithAssemblyAI = async (videoId) => {
   }
 
   console.error('AssemblyAI transcription timed out after', attempts, 'attempts')
-  throw new Error('Transcription timed out')
+  throw new Error('Transcription timed out. This video may be too long.')
 }
 
 export default async function handler(req, res) {
@@ -162,13 +208,10 @@ export default async function handler(req, res) {
         channel = item?.channel || item?.channelName || ''
         console.log('Transcript from Apify:', transcript ? 'Success' : 'Empty')
 
-        // If we got a transcript, check if it's not English and translate if needed
+        // If we got a transcript, translate to English
         if (transcript) {
           try {
-            // Simple check: does it contain mostly non-English characters?
-            // For now, we'll just always try to translate to English (in case it's non-English)
-            // But we could add language detection here
-            console.log('Checking if transcript needs translation to English')
+            console.log('Translating transcript to English...')
             transcript = await translateTextToEnglish(transcript)
           } catch (translateErr) {
             console.error('Failed to translate transcript, keeping original:', translateErr)
@@ -199,7 +242,7 @@ export default async function handler(req, res) {
         }
       } catch (e) {
         console.error('AssemblyAI transcription failed:', e)
-        throw new Error('Unable to generate transcript for this video. The video may be private, unavailable, or too long.')
+        throw new Error(e.message || 'Unable to generate transcript for this video.')
       }
     }
     
